@@ -577,10 +577,10 @@ class DQN:
 
     def take_action(self, state):
         """epsilon-贪婪策略选取动作"""
-        if np.random.random() > self.epsilon:
+        if np.random.random() < self.epsilon:
             action = np.random.randint(self.action_dim)
         else:
-            state = torch.tensor([state], dtype=torch.float).to(self.device)
+            state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
             action = self.q_net(state).argmax().item()
         return action
 
@@ -621,4 +621,7 @@ class DQN:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.count += 1
 
-def get_gpu
+
+def get_gpu():
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    return device
