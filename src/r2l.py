@@ -5,10 +5,11 @@ Author: github@AustinSuun
 Data: 2025-05-24
 """
 
-# __version__= "0.1"
+__version__ = "0.1"
 
 # 核心库
 import copy
+import random
 
 # 三方库
 import numpy as np
@@ -349,3 +350,155 @@ def print_agent_ch4(agent, env, action_meaning, disaster=[], end=[]):
                     pi_str += action_meaning[k] if a[k] > 0 else "🅾️"
                 print(pi_str, end=" ")
         print()
+
+
+## Q-learning 算法
+
+
+class QLearning:
+    """Q-learning 算法"""
+
+    def __init__(self, ncol, nrow, epsilon, alpha, gamma, n_action=4):
+        self.Q_table = np.zeros([ncol * nrow, n_action])
+        self.epsilon = epsilon  # 贪婪策略参数
+        self.alpha = alpha  # 学习率
+        self.gamma = gamma  # 折扣因子
+        self.n_action = n_action  # 动作个数
+
+    def take_action(self, state):
+        """epsilon-贪婪算法，选取下一步动作"""
+        if np.random.random() < self.epsilon:
+            action = np.random.randint(self.n_action)
+        else:
+            action = np.argmax(self.Q_table[state])
+        return action
+
+    def best_action(self, state):
+        """用于打印策略|最优动作"""
+        Qmax = max(self.Q_table[state])
+        a = [0 for _ in range(self.n_action)]
+        for i in range(self.n_action):
+            if self.Q_table[state, i] == Qmax:
+                a[i] = 1
+        return a
+
+    def update(self, s0, a0, r, s1):
+        """更新"""
+        td_error = r + self.gamma * self.Q_table[s1].max() - self.Q_table[s0, a0]
+        self.Q_table[s0, a0] += self.alpha * td_error
+
+
+# 第六章 Dyna-Q算法
+
+
+class CliffWalkingEnv_ch6:
+    """冰湖环境，用于Dyna-Q算法"""
+
+    def __init__(self, ncol, nrow):
+        self.ncol = ncol
+        self.nrow = nrow
+        self.x = 0  # 智能体初始位置
+        self.y = self.nrow - 1
+
+    def step(self, action):
+        """更新智能体位置，通过传入的动作"""
+        # 上下左右， 坐标原点左上角
+        change = [[0, -1], [0, 1], [-1, 0], [1, 0]]
+
+        self.x = min(self.ncol - 1, max(0, self.x + change[action][0]))
+        self.y = min(self.nrow - 1, max(0, self.y + change[action][1]))
+
+        next_state = self.y * self.ncol + self.x
+        reward = -1
+        done = False
+        if self.x > 0 and self.y == self.nrow - 1:
+            done = True
+            if self.x != self.ncol - 1:
+                reward = -100
+
+        return next_state, reward, done
+
+    def reset(self):
+        """重设环境，智能体位置复原"""
+        self.x = 0
+        self.y = self.nrow - 1
+        return self.y * self.ncol + self.x
+
+
+## Dynn-Q算法
+
+
+class DynaQ:
+    """Dyna-Q 算法"""
+
+    def __init__(self, ncol, nrow, epsilon, alpha, gamma, n_planning, n_action=4):
+        self.Q_table = np.zeros([ncol * nrow, n_action])  # 初始化Q(s,a)表格
+        self.epsilon = epsilon  # epsilon贪婪策略参数
+        self.alpha = alpha  # 学习率
+        self.gamma = gamma  # 折扣因子
+        self.n_action = n_action  # 动作个数
+
+        self.n_planning = (
+            n_planning  # Q_planning 的次数，Q_planning是一步的，不是连续的
+        )
+        self.model = dict()  # 环境模型
+
+    def take_action(self, state):
+        """选取下一步动作"""
+        if np.random.random() < self.epsilon:
+            action = np.random.randint(self.n_action)
+        else:
+            action = np.argmax(self.Q_table[state])
+        return action
+
+    def q_learning(self, s0, a0, r, s1):
+        """Q-learning 更新"""
+        td_error = r + self.gamma * self.Q_table[s1].max() - self.Q_table[s0, a0]
+        self.Q_table[s0, a0] += self.alpha * td_error
+
+    def update(self, s0, a0, r, s1):
+        """更新 1 次 Q-learning 和 n 次 Q-planning"""
+        self.q_learning(s0, a0, r, s1)
+        self.model[(s0, a0)] = r, s1  # 将数据添加到环境模型
+        # Q-planing 循环
+        for _ in range(self.n_planning):
+            # 随机尝试曾经遇到的状态动作对
+            (s, a), (r, s_) = random.choice(list(self.model.items()))
+            self.q_learning(s, a, r, s_)
+
+
+def DynaQ_CliffWalking(n_planning):
+    """Dyna-Q 训练函数"""
+    ncol = 12
+    nrow = 4
+    env = CliffWalkingEnv_ch6(ncol, nrow)
+    epsilon = 0.01
+    alpha = 0.1
+    gamma = 0.9
+    agent = DynaQ(ncol, nrow, epsilon, alpha, gamma, n_planning)
+    num_episodes = 300  # 智能体在环境中运行的序列
+
+    return_list = []  # 记录每一条序列的回报
+    for i in range(10):
+        with tqdm(total=int(num_episodes / 10), desc="Iteration %d" % i) as pbar:
+            for i_episode in range(int(num_episodes / 10)):
+                episode_return = 0
+                state = env.reset()
+                done = False
+                while not done:
+                    action = agent.take_action(state)
+                    next_state, reward, done = env.step(action)
+                    episode_return += reward
+                    agent.update(state, action, reward, next_state)
+                    state = next_state
+                return_list.append(episode_return)
+                if (i_episode + 1) % 10 == 0:  # 每10条序列打印一下这10条序列的平均回报
+                    pbar.set_postfix(
+                        {
+                            "episode": "%d" % (num_episodes / 10 * i + i_episode + 1),
+                            "return": "%.3f" % np.mean(return_list[-10:]),
+                        }
+                    )
+
+                pbar.update(1)
+    return return_list
