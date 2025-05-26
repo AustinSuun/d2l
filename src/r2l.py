@@ -10,12 +10,16 @@ __version__ = "0.1"
 # 核心库
 import copy
 import random
+import collections
 
 # 三方库
 import numpy as np
 import gymnasium as gym
 import matplotlib.pyplot as plt
 from tqdm import tqdm  # 显示循环进度条
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 """
 代码从第四章开始
@@ -502,3 +506,119 @@ def DynaQ_CliffWalking(n_planning):
 
                 pbar.update(1)
     return return_list
+
+
+# 第七章 DQN算法
+class ReplayBuffer:
+    """经验回放池"""
+
+    def __init__(self, capacity):
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def add(self, state, action, reward, next_state, done):
+        """将数据添加到buffer"""
+        self.buffer.append((state, action, reward, next_state, done))
+
+    def sample(self, batch_size):
+        """从buffer 中采样数据，数据量为 batch_size"""
+        # 形状：[batch_size, 4]
+        transitions = random.sample(self.buffer, batch_size)
+        # 把解包之后的数据，按照状态，动作等串起来，成为元组
+        state, action, reward, next_state, done = zip(*transitions)
+        return np.array(state), action, reward, next_state, done
+
+    def size(self):
+        """目前buffer中数据量"""
+        return len(self.buffer)
+
+
+class Qnet(nn.Module):
+    """只有一层隐藏层的 Q 网络"""
+
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))  # 使用ReLU 激活函数
+        return self.fc2(x)
+
+
+## DQN 算法
+
+
+class DQN:
+    """DQN 算法"""
+
+    def __init__(
+        self,
+        state_dim,
+        hidden_dim,
+        action_dim,
+        lr,
+        gamma,
+        epsilon,
+        target_update,
+        device,
+    ):
+        self.action_dim = action_dim
+        self.q_net = Qnet(state_dim, hidden_dim, action_dim).to(device)
+        # 目标网络
+        self.target_q_net = Qnet(state_dim, hidden_dim, action_dim).to(device)
+        # 使用 Adam 优化器
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+        self.gamma = gamma  # 折扣因子
+        self.epsilon = epsilon
+        self.target_update = target_update  # 目标网络更新频率
+
+        self.count = 0  # 计数，器记录更新次数
+        self.device = device
+
+    def take_action(self, state):
+        """epsilon-贪婪策略选取动作"""
+        if np.random.random() > self.epsilon:
+            action = np.random.randint(self.action_dim)
+        else:
+            state = torch.tensor([state], dtype=torch.float).to(self.device)
+            action = self.q_net(state).argmax().item()
+        return action
+
+    def update(self, transition_dict):
+        """更新"""
+        states = torch.tensor(transition_dict["states"], dtype=torch.float).to(
+            self.device
+        )
+        actions = torch.tensor(transition_dict["actions"]).view(-1, 1).to(self.device)
+        rewards = (
+            torch.tensor(transition_dict["rewards"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        next_states = torch.tensor(
+            transition_dict["next_states"], dtype=torch.float
+        ).to(self.device)
+        done = (
+            torch.tensor(transition_dict["dones"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        # 把动作对应的输出值 抠出来
+        q_values = self.q_net(states).gather(1, actions)  # Q 值
+        # 下个状态的最大 Q 值，这个只是数值，不参与 反向传播，
+        # 里面的动作都是最大化取值，和actions没有关系
+        max_next_q_values = self.target_q_net(next_states).max(1)[0].view(-1, 1)
+        # TD 误差目标
+        q_targets = rewards + self.gamma * max_next_q_values * (1 - done)
+        # 均方误差损失
+        dqn_loss = torch.mean(F.mse_loss(q_values, q_targets))
+        self.optimizer.zero_grad()  # 清零梯度
+        dqn_loss.backward()  # 反向传播
+        self.optimizer.step()
+
+        if self.count % self.target_update == 0:
+            # 更新目标网络
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.count += 1
+
+def get_gpu
