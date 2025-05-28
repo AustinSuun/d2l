@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+
 """
 代码从第四章开始
 """
@@ -525,7 +526,7 @@ class ReplayBuffer:
         transitions = random.sample(self.buffer, batch_size)
         # 把解包之后的数据，按照状态，动作等串起来，成为元组
         state, action, reward, next_state, done = zip(*transitions)
-        return np.array(state), action, reward, next_state, done
+        return np.array(state), action, reward, np.array(next_state), done
 
     def size(self):
         """目前buffer中数据量"""
@@ -625,3 +626,138 @@ class DQN:
 def get_gpu():
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     return device
+
+
+class DQN_D:
+    """DQN 算法， 包括Double DQN 算法"""
+
+    def __init__(
+        self,
+        state_dim,
+        hidden_dim,
+        action_dim,
+        lr,
+        gamma,
+        epsilon,
+        target_update,
+        device,
+        dqn_type="VanillaDQN",
+    ):
+        self.action_dim = action_dim
+        self.q_net = Qnet(state_dim, hidden_dim, self.action_dim).to(device)
+        self.target_q_net = Qnet(state_dim, hidden_dim, self.action_dim).to(device)
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=lr)
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.target_update = target_update
+        self.device = device
+        self.count = 0
+        self.dqn_type = dqn_type
+
+    def take_action(self, state):
+        """采取动作"""
+        if np.random.random() < self.epsilon:
+            action = np.random.randint(self.action_dim)
+        else:
+            state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+            action = self.q_net(state).argmax().item()
+        return action
+
+    def max_q_values(self, state):
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        return self.q_net(state).max().item()
+
+    def update(self, transition_dict):
+        states = torch.tensor(transition_dict["states"], dtype=torch.float).to(
+            self.device
+        )
+        actions = torch.tensor(transition_dict["actions"]).view(-1, 1).to(self.device)
+        rewards = (
+            torch.tensor(transition_dict["rewards"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        next_states = torch.tensor(
+            transition_dict["next_states"], dtype=torch.float
+        ).to(self.device)
+        dones = (
+            torch.tensor(transition_dict["dones"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+
+        q_values = self.q_net(states).gather(1, actions)
+        # DQN 和 Double DQN 区别
+        if self.dqn_type == "DoubleDQN":
+            max_action = self.q_net(next_states).max(1)[1].view(-1, 1)
+            max_next_q_values = self.target_q_net(next_states).gather(1, max_action)
+        else:
+            max_next_q_values = self.target_q_net(next_states).max(1)[0].view(-1, 1)
+        q_targets = rewards + self.gamma * max_next_q_values * (1 - dones)
+        dqn_loss = torch.mean(F.mse_loss(q_targets, q_values))
+        self.optimizer.zero_grad()
+        dqn_loss.backward()
+        self.optimizer.step()
+
+        if self.count % self.target_update == 0:
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.count += 1
+
+
+def dis_to_con(discrete_action, env, action_dim):
+    """离散动作转回连续动作"""
+    action_lowbound = env.action_space.low[0]  # 连续动作最小值
+    action_upbound = env.action_space.high[0]  # 连续动作最大值
+    return action_lowbound + (discrete_action / (action_dim - 1)) * (
+        action_upbound - action_lowbound
+    )
+
+
+def train_dqn(agent, env, num_episode, replay_buffer, minimal_size, batch_size):
+    return_list = []
+    max_q_value_list = []
+    max_q_value = 0
+
+    for i in range(10):
+        with tqdm(total=int(num_episode / 10), desc="Iterstion: %d" % i) as pbar:
+            for episode_i in range(int(num_episode / 10)):
+                episode_return = 0
+                state, _ = env.reset()
+                done = False
+                while not done:
+                    action = agent.take_action(state)
+                    # 平滑处理
+                    max_q_value = (
+                        agent.max_q_values(state) * 0.005 + max_q_value * 0.995
+                    )
+                    # 保存每个状态下的最大Q值
+                    max_q_value_list.append(max_q_value)
+                    action_continuous = dis_to_con(action, env, agent.action_dim)
+                    next_state, reward, terminated, truncated, _ = env.step(
+                        [action_continuous]
+                    )
+                    done = terminated or truncated
+                    replay_buffer.add(state, action, reward, next_state, done)
+                    state = next_state
+                    episode_return += reward
+
+                    if replay_buffer.size() > minimal_size:
+                        b_s, b_a, b_r, b_ns, b_d = replay_buffer.sample(batch_size)
+                        transition_dict = {
+                            "states": b_s,
+                            "actions": b_a,
+                            "rewards": b_r,
+                            "next_states": b_ns,
+                            "dones": b_d,
+                        }
+                        agent.update(transition_dict)
+                return_list.append(episode_return)
+                if (episode_i + 1) % 10 == 0:
+                    pbar.set_postfix(
+                        {
+                            "episode": "%d" % (num_episode / 10 * i + episode_i + 1),
+                            "return": "%.3f" % np.mean(return_list[-10:]),
+                        }
+                    )
+                pbar.update(1)
+    return return_list, max_q_value_list
