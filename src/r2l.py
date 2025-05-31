@@ -16,6 +16,7 @@ import collections
 import numpy as np
 import gymnasium as gym
 import matplotlib.pyplot as plt
+import torch.optim.adam
 from tqdm import tqdm  # 显示循环进度条
 import torch
 import torch.nn.functional as F
@@ -761,3 +762,322 @@ def train_dqn(agent, env, num_episode, replay_buffer, minimal_size, batch_size):
                     )
                 pbar.update(1)
     return return_list, max_q_value_list
+
+
+class VAnet(nn.Module):
+    """只有一层隐藏层的A网络和V网络"""
+
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+
+        self.fc_A = nn.Linear(hidden_dim, action_dim)
+        self.fc_V = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        A = self.fc_A(F.relu(self.fc1(x)))
+        V = self.fc_V(F.relu(self.fc1(x)))
+        Q = (
+            V + A - A.mean(1).view(-1, 1)
+        )  # 使用V值和A值计算得到，减去均值保证模型稳定性
+        return Q
+
+
+class DQN_DD:
+    """DQN算法，包罗Double DQN 和 Dueling DQN"""
+
+    def __init__(
+        self,
+        state_dim,
+        hidden_dim,
+        action_dim,
+        learning_rate,
+        gamma,
+        epsilon,
+        target_update,
+        device,
+        dqn_type="VanillaDQN",
+    ):
+        self.action_dim = action_dim
+        if dqn_type == "DuelingDQN":
+            # DUelingDQN网络架构不一样
+            self.q_net = VAnet(state_dim, hidden_dim, action_dim).to(device)
+            self.target_q_net = VAnet(state_dim, hidden_dim, action_dim).to(device)
+        else:
+            self.q_net = Qnet(state_dim, hidden_dim, action_dim)
+            self.target_q_net = Qnet(state_dim, hidden_dim, action_dim)
+
+        self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=learning_rate)
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.target_update = target_update
+        self.count = 0
+        self.dqn_type = dqn_type
+        self.device = device
+
+    def take_action(self, state):
+        if np.random.random() < self.epsilon:
+            action = np.random.randint(self.action_dim)
+        else:
+            state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+            action = self.q_net(state).argmax().item()
+        return action
+
+    def max_q_values(self, state):
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        return self.q_net(state).max().item()
+
+    def update(self, transition_dict):
+        states = torch.tensor(transition_dict["states"], dtype=torch.float).to(
+            self.device
+        )
+        actions = torch.tensor(transition_dict["actions"]).view(-1, 1).to(self.device)
+        rewards = (
+            torch.tensor(transition_dict["rewards"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        next_states = torch.tensor(
+            transition_dict["next_states"], dtype=torch.float
+        ).to(self.device)
+        dones = (
+            torch.tensor(transition_dict["dones"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+
+        q_values = self.q_net(states).gather(1, actions)
+        if self.dqn_type == "DoubleDQN":
+            max_action = self.q_net(next_states).max(1)[1].view(-1, 1)
+            max_next_q_values = self.target_q_net(next_states).gather(1, max_action)
+        else:
+            max_next_q_values = self.target_q_net(next_states).max(1)[0].view(-1, 1)
+
+        q_targets = rewards + self.gamma * max_next_q_values * (1 - dones)
+        dqn_loss = torch.mean(F.mse_loss(q_targets, q_values))
+        self.optimizer.zero_grad()
+        dqn_loss.backward()
+        self.optimizer.step()
+
+        if self.count % self.target_update == 0:
+            self.target_q_net.load_state_dict(self.q_net.state_dict())
+        self.count += 1
+
+
+# 第九章 REINFORCE
+
+
+class PolicyNet(nn.Module):
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        return F.softmax(self.fc2(x), dim=1)
+
+
+class REINFORCE:
+    """ "REINFORCE算法"""
+
+    def __init__(self, state_dim, hidden_dim, action_dim, learning_rate, gamma, device):
+        self.policy_net = PolicyNet(state_dim, hidden_dim, action_dim).to(device)
+        self.optimizer = torch.optim.Adam(
+            self.policy_net.parameters(), lr=learning_rate
+        )
+        self.gamma = gamma
+        self.device = device
+
+    def take_action(self, state):  # 根据动作概率分布随机采样
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        probs = self.policy_net(state)
+        # 构建一个采样器，输入一个分布，方便从里面采样
+        action_dist = torch.distributions.Categorical(probs)
+        action = action_dist.sample()
+        return action.item()
+
+    def update(self, transition_dict):
+        reward_list = transition_dict["rewards"]
+        state_list = transition_dict["states"]
+        action_list = transition_dict["actions"]
+
+        G = 0
+        self.optimizer.zero_grad()
+        for i in reversed(range(len(reward_list))):  # 从最后一步开始计算
+            reward = reward_list[i]
+            state = (
+                torch.tensor(state_list[i], dtype=torch.float)
+                .unsqueeze(0)
+                .to(self.device)
+            )
+            action = (
+                torch.tensor(action_list[i]).unsqueeze(0).view(-1, 1).to(self.device)
+            )
+            log_prob = torch.log(self.policy_net(state).gather(1, action))
+            G = self.gamma * G + reward
+            loss = -log_prob * G  # 每一步的损失函数
+            loss.backward()  # 反向传播计算梯度
+        self.optimizer.step()  # 梯度下降，上述梯度会累积
+
+
+class ValueNet(nn.Module):
+    """价值函数网络，输入state，输出value（一个数值）"""
+
+    def __init__(self, state_dim, hidden_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+
+class ActorCritic:
+    """Actor-Critic 算法,这个实际是A2C，使用了优势函数"""
+
+    def __init__(
+        self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr, gamma, device
+    ):
+        # 策略网络 和 价值网络
+        self.actor = PolicyNet(state_dim, hidden_dim, action_dim)
+        self.critic = ValueNet(state_dim, hidden_dim)
+        # 策略网络优化器
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.gamma = gamma
+        self.device = device
+
+    def take_action(self, state):
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        probs = self.actor(state)
+        action_dist = torch.distributions.Categorical(probs)
+        action = action_dist.sample()
+        return action.item()
+
+    def update(self, transition_dict):
+        states = torch.tensor(transition_dict["states"], dtype=torch.float).to(
+            self.device
+        )
+        actions = torch.tensor(transition_dict["actions"]).view(-1, 1).to(self.device)
+        rewards = (
+            torch.tensor(transition_dict["rewards"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        next_states = torch.tensor(
+            transition_dict["next_states"], dtype=torch.float
+        ).to(self.device)
+        dones = (
+            torch.tensor(transition_dict["dones"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+
+        # 时序差分目标
+        td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
+        # 优势函数 的 近似值，使用只是用V函数，来表示优势函数 A
+        td_delta = td_target - self.critic(states)
+        log_probs = torch.log(self.actor(states).gather(1, actions))
+        actor_loss = torch.mean(-log_probs * td_delta.detach())
+        # 均方损失误差
+        critic_loss = torch.mean(F.mse_loss(self.critic(states), td_target.detach()))
+        self.actor_optimizer.zero_grad()
+        self.critic_optimizer.zero_grad()
+        actor_loss.backward()
+        critic_loss.backward()
+        self.actor_optimizer.step()
+        self.critic_optimizer.step()
+
+
+# 第十一章TRPO算法
+
+
+class TRPO:
+    """TRPO 算法"""
+
+    def __init__(
+        self,
+        hidden_dim,
+        state_space,
+        action_space,
+        lmbda,
+        kl_constraint,
+        alpha,
+        critic_lr,
+        gamma,
+        device,
+    ):
+        state_dim = state_space.shape[0]
+        action_dim = action_space.n
+
+        # 策略网络参数不需要优化器更新
+        self.actor = PolicyNet(state_dim, hidden_dim, action_dim).to(device)
+        self.critic = ValueNet(state_dim, hidden_dim).to(device)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+        self.gamma = gamma
+        self.lmbda = lmbda  # GAE 参数
+        self.kl_constraint = kl_constraint
+        self.alpha = alpha
+        self.device = device
+
+    def take_action(self, state):
+        """离散型输出，选取动作，输出动作概率分布，然后从中采样一个动作"""
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        probs = self.actor(state)
+        action_dist = torch.distributions.Categorical(probs)
+        action = action_dist.sample()
+        return action.item()
+
+    def hessian_matrix_vector_product(self, states, old_action_dists, vector):
+        """计算黑赛矩阵 和 一个向量的乘积"""
+        new_action_dists = torch.distributions.Categorical(self.actor(states))
+        # 计算平均 KL 距离
+        kl = torch.mean(
+            torch.distributions.kl.kl_divergence(old_action_dists, new_action_dists)
+        )
+        kl_grad = torch.autograd.grad(kl, self.actor.parameters(), create_graph=True)
+        kl_grad_vector = torch.cat([grad.vier(-1) for grad in kl_grad])
+        # KL 距离的梯度先河向量进行进行点积运算
+        kl_grad_vector_product = torch.dot(kl_grad_vector, vector)
+        grad2 = torch.autograd.grad(kl_grad_vector_product, self.actor.parameters())
+        grad2_vector = torch.cat([grad.view(-1) for grad in grad2])
+        return grad2_vector
+
+    def conjugate_gradient(self, grad, states, old_action_dists):
+        """共轭梯度法求解方程"""
+        # x 是初始方向对应 v
+        x = torch.zeros_like(grad)
+        # 是当前方向
+        r = grad.clone()
+        # 是前一次的方向
+        p = grad.clone()
+        rdotr = torch.dot(r, r)
+
+        for i in range(10):  # 共轭梯度主循环
+            Hp = self.hessian_matrix_vector_product(states, old_action_dists, p)
+            # alpha 是步长
+            alpha = rdotr / torch.dot(p, Hp)
+            # 更新 估计
+            x += alpha * p
+            # 更新残差
+            r -= alpha * Hp
+            new_rdotr = torch.dot(r, r)
+            if new_rdotr < 1e-10:
+                break
+            # 计算beta ，保证共轭性更新方向
+            beta = new_rdotr / rdotr
+            # 更新搜索方向
+            p = r + beta * p
+            rdotr = new_rdotr
+        return x
+
+    def compute_surrogate_obj(self, states, actions, advantage, old_log_probs, actor):
+        """计算策略目标"""
+        log_probs = torch.log(actor(states.gather(1, actions)))
+        ratio = torch.exp(log_probs - old_log_probs)
+        return torch.mean(ratio * advantage)
+
+    def line_search(self, states, actions, advantage, old_log_probs, old_action_dists, max_vec):
+        
