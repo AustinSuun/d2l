@@ -11,6 +11,7 @@ __version__ = "0.1"
 import copy
 import random
 import collections
+import itertools
 
 # 三方库
 import numpy as np
@@ -21,7 +22,7 @@ from tqdm import tqdm  # 显示循环进度条
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+from scipy.stats import truncnorm
 
 """
 代码从第四章开始
@@ -532,6 +533,11 @@ class ReplayBuffer:
     def size(self):
         """目前buffer中数据量"""
         return len(self.buffer)
+
+    def return_all_samples(self):
+        all_transitions = list(self.buffer)
+        state, action, reward, next_state, done = zip(*all_transitions)
+        return np.array(state), action, reward, np.array(next_state), done
 
 
 class Qnet(nn.Module):
@@ -1576,7 +1582,7 @@ class PPOCountinuous:
 
 # 第 13 章 DDPG 算法
 """
-PPO 和 TRPO 是随机策略，因为策略网络输出的 mu 和 std，输出的是一个分布，还需要从中采样
+PPO 和 TRPO 是随机策略，因为策略网络输出的 mu 和 std,输出的是一个分布,还需要从中采样
 DDPG 是确定性策略，策略网络直接输出 动作的数值
 """
 
@@ -1717,6 +1723,795 @@ class DDPG:
         actor_loss.backward()
         self.actor_optimizer.step()
 
-        # 软更新
+        # 软更新 目标网络
         self.soft_updata(self.actor, self.target_actor)
         self.soft_updata(self.critic, self.target_critic)
+
+
+# 第十六章 模型预测控制 MPC
+
+
+class CEM:
+    """交叉熵选取动作"""
+
+    def __init__(self, n_sequence, elite_ratio, fake_env, upper_bound, lower_bound):
+        self.n_sequence = n_sequence
+        self.elite_ratio = elite_ratio
+        self.upper_bound = upper_bound
+        self.lower_bound = lower_bound
+        self.fake_env = fake_env  # 模拟环境的模型
+
+    def optimizer(self, state, init_mean, init_var):
+        """选取动作，通过优化五次，选出一个动作序列"""
+        mean = init_mean
+        var = init_var
+        # X 是在生成了一个 action_dim * 动作长度 长度的一个 分布
+        # 这个分布使用了截断 保证 采样在 mean +- 2*sigmoid 范围中
+        # 分布的 mean 和var 使用np矩阵表示
+        # 后面直接采样 就可以的到这一连串动作的每一个动作维度的 动作数据
+        # 然后评估动作来优化 这个序列的 mean，来优化下一次动作序列的选择
+        X = truncnorm(-2, 2, loc=np.zeros_like(mean), scale=np.ones_like(var))
+        # 初始状态， 复制 序列数 个个数，每一次优化使用 n_sequence 条动作序列
+        state = np.tile(state, (self.n_sequence, 1))
+
+        for _ in range(5):
+            # 得到 当前均值 到上界和下界的距离
+            # 采样时 需要限制 方差，保证当mean 靠近上下界的时候 采样的的大部分数据不会越界
+            # 因此需要让 均值到 边界的距离 保持在 2 * sigmoid ，让 95% 的采样数据在边界内
+            # 反向推导出 方差 是 contrained_var
+            # 只需要更靠近的哪一个边界距离 满足就可以，然后求出方差的限制，
+            # 真实的采样方差不能超过这个限制，得到方差用于后续采样
+            lb_list, ub_list = mean - self.lower_bound, self.upper_bound - mean
+
+            contrained_var = np.minimum(
+                np.minimum(np.square(lb_list / 2), np.square(ub_list / 2)), var
+            )
+
+            # 生成动作序列
+            action_sequences = (
+                X.rvs(size=(self.n_sequence, mean.shape[0])) * np.sqrt(contrained_var)
+                + mean
+            )
+            # action_sequences = [X.rvs() for _ in range(self.n_sequence)] * np.sqrt(
+            #   contrained_var
+            # ) + mean
+            # 计算动作序列的累计奖励, 对n条动作序列，进行模拟，得到模型评估奖励
+            returns = self.fake_env.propagate(state, action_sequences)[:, 0]
+            # 选取奖励最高的若干条动作序列 作为精英|elite序列
+            elites = action_sequences[np.argsort(returns)][
+                -int(self.elite_ratio * self.n_sequence) :
+            ]
+            # elite 序列每一个维度的均值
+            new_mean = np.mean(elites, axis=0)
+            new_var = np.var(elites, axis=0)
+
+            # 更新动作序列分布
+            mean = 0.1 * mean + 0.9 * new_mean
+            var = 0.1 * var + 0.9 * new_var
+        return mean  # 返回的mean，直接代表选取的动作的动作值，其中包括每个动作维度，所有动作的动作维度平摊成 1维
+
+
+class Swish(nn.Module):
+    """Swish 激活函数"""
+
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+
+def init_weights(m):
+    """初始化模型权重"""
+
+    def truncated_normal_init(t, mean=0.0, std=0.01):
+        """截断式初始化"""
+        with torch.no_grad():
+            tmp = torch.randn_like(t) * std + mean
+            while True:
+                cond = (tmp < mean - 2 * std) | (tmp > mean + 2 * std)
+                if not cond.any():
+                    break
+                tmp = torch.where(
+                    cond,
+                    torch.randn_like(tmp) * std + mean,  # 重新采样的值
+                    tmp,  # 保留不需要替换的部分
+                )
+            return tmp.to(t.device)
+
+    if isinstance(m, nn.Linear) or isinstance(m, FCLayer):
+        std = 1 / (2 * np.sqrt(m._input_dim))
+        m.weight.data.copy_(truncated_normal_init(m.weight, std=std))
+        m.bias.data.fill_(0.0)
+
+
+class FCLayer(nn.Module):
+    """集成之后的全连接层"""
+
+    def __init__(self, input_dim, output_dim, ensemble_size, activation, device):
+        super().__init__()
+        self._input_dim, self._output_dim = input_dim, output_dim
+        self.weight = nn.Parameter(
+            torch.Tensor(ensemble_size, input_dim, output_dim).to(device)
+        )
+        self._activation = activation
+        self.bias = nn.Parameter(torch.Tensor(ensemble_size, output_dim).to(device))
+
+    def forward(self, x):
+        # 输入  集成模型数量， 输入维度
+        # 参数w维度   集成模型数量， 输入维度， 输出维度
+        # 使用 bmm 保持第一个维度
+        return self._activation(
+            torch.add(torch.bmm(x, self.weight), self.bias[:, None, :])
+        )
+
+
+class EnsembleModel(nn.Module):
+    """环境集成, 环境模型"""
+
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        device,
+        ensemble_size=5,
+        learning_rate=1e-3,
+    ):
+        super().__init__()
+        # 输出包括每一个动作维度的方差和均值，还有奖励的
+        self._output_dim = (state_dim + 1) * 2
+        # 方差对数后的限制 ，初始最大是 0.5， 最小 -10
+        self._max_logvar = nn.Parameter(
+            (torch.ones((1, self._output_dim // 2)).float() / 2).to(device),
+            requires_grad=False,
+        )
+        self._min_logvar = nn.Parameter(
+            (-torch.ones((1, self._output_dim // 2)).float() * 10).to(device),
+            requires_grad=False,
+        )
+
+        self.layer1 = FCLayer(
+            state_dim + action_dim, 200, ensemble_size, Swish(), device
+        )
+        self.layer2 = FCLayer(200, 200, ensemble_size, Swish(), device)
+        self.layer3 = FCLayer(200, 200, ensemble_size, Swish(), device)
+        self.layer4 = FCLayer(200, 200, ensemble_size, Swish(), device)
+        self.layer5 = FCLayer(
+            200, self._output_dim, ensemble_size, nn.Identity(), device
+        )
+        self.apply(init_weights)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
+
+    def forward(self, x, return_log_var=False):
+        ret = self.layer5(self.layer4(self.layer3(self.layer2(self.layer1(x)))))
+        mean = ret[:, :, : self._output_dim // 2]
+        # PETS算法中， 将方差控制在最大最小值之间
+        logvar = self._max_logvar - F.softplus(
+            self._max_logvar - ret[:, :, self._output_dim // 2 :]
+        )
+        logvar = self._min_logvar + F.softplus(logvar - self._min_logvar)
+
+        return mean, logvar if return_log_var else torch.exp(logvar)
+
+    def loss(self, mean, logver, labels, use_var_loss=True):
+        # 方差相反数，为负数
+        inverse_var = torch.exp(-logver)
+        if use_var_loss:
+            # 高斯分布下的 负对数似然， mse_loss + 1/2 * var_loss, 这里省略系数 1/2
+            # 维度 Batch_size, 时间步|horizon, action_dim ==> Batch_size
+            mse_loss = torch.mean(
+                torch.mean(torch.pow(mean - labels, 2) * inverse_var, dim=-1), dim=-1
+            )
+            var_losss = torch.mean(torch.mean(logver, dim=-1), dim=-1)
+            total_loss = torch.sum(mse_loss) + torch.sum(var_losss)
+        else:
+            mse_loss = torch.mean(torch.pow(mean - labels, 2), dim=(-1, -2))
+            total_loss = torch.sum(mse_loss)
+
+        return total_loss, mse_loss
+
+    def train(self, loss):
+        self.optimizer.zero_grad()
+        # loss 加上 logvar 的上下界 的L1范数作为正则项, 约束 上下界不要过大
+        loss += 0.01 * torch.sum(self._max_logvar) - 0.01 * torch.sum(self._min_logvar)
+        loss.backward()
+        self.optimizer.step()
+
+
+class EnsembleDynamicsModel:
+    """环境模型集成， 加入精细化的训练"""
+
+    def __init__(self, state_dim, action_dim, device, num_network=5):
+        self._num_network = num_network
+        self._state_dim = state_dim
+        self._action_dim = action_dim
+        self.model = EnsembleModel(
+            state_dim, action_dim, device, ensemble_size=num_network
+        )
+        self._epoch_since_last_update = 0
+        self.device = device
+
+    def train(self, inputs, labels, batch_size=64, holdout_ratio=0.1, max_iter=20):
+        # 设置训练集 和 验证集
+        permutation = np.random.permutation(inputs.shape[0])  # 生成随机索引
+        inputs, labels = inputs[permutation], labels[permutation]
+        num_holdout = int(inputs.shape[0] * holdout_ratio)  # 验证集数量
+        train_inputs, train_labels = inputs[num_holdout:], labels[num_holdout:]
+        holdout_inputs, holdout_labels = inputs[:num_holdout], labels[:num_holdout]
+        holdout_inputs = torch.from_numpy(holdout_inputs).float().to(self.device)
+        holdout_labels = torch.from_numpy(holdout_labels).float().to(self.device)
+        holdout_inputs = holdout_inputs[None, :, :].repeat([self._num_network, 1, 1])
+        holdout_labels = holdout_labels[None, :, :].repeat([self._num_network, 1, 1])
+
+        # 保存每个模型中的最好结果，保存为元组 (迭代次数， loss)
+        self._snapshots = {i: (None, 1e10) for i in range(self._num_network)}
+
+        for epoch in itertools.count():  # 无穷循环
+            train_index = np.stack(
+                [
+                    np.random.permutation(train_inputs.shape[0])
+                    for _ in range(self._num_network)
+                ]
+            )
+            # 所有真实数据都用来训练
+            for batch_start_pos in range(0, train_inputs.shape[0], batch_size):
+                batch_index = train_index[
+                    :, batch_start_pos : batch_start_pos + batch_size
+                ]
+                train_input = (
+                    torch.from_numpy(train_inputs[batch_index]).float().to(self.device)
+                )
+                train_label = (
+                    torch.from_numpy(train_labels[batch_index]).float().to(self.device)
+                )
+
+                mean, logvar = self.model(train_input, return_log_var=True)
+                loss, _ = self.model.loss(mean, logvar, train_label)
+                self.model.train(loss)
+
+            with torch.no_grad():
+                mean, logvar = self.model(holdout_inputs, return_log_var=True)
+                _, holdout_losses = self.model.loss(
+                    mean, logvar, holdout_labels, use_var_loss=False
+                )
+                holdout_losses = holdout_losses.cpu()
+                break_condition = self._save_best(epoch, holdout_losses)
+                # 结束条件 1. 五次没有更新 _snapshots ,学习之后没有更好的表现
+                #         2. 达到最大迭代次数 20
+                if break_condition or epoch > max_iter:
+                    break
+
+    def _save_best(self, epoch, losses, threshold=0.1):
+        """训练之后，使用验证集，如果提升大于阈值，更新每个模型的最优结果"""
+        updated = False
+        for i in range(len(losses)):
+            current = losses[i]
+            _, best = self._snapshots[i]
+            improvement = (best - current) / best
+            if improvement > threshold:
+                self._snapshots[i] = (epoch, current)  # 更新最优结果
+                updated = True
+            self._epoch_since_last_update = (
+                0 if updated else self._epoch_since_last_update + 1
+            )
+            return self._epoch_since_last_update > 5  # 五次没有更新 结束当前训练
+
+    def predict(self, inputs, batch_size=64):
+        """在进行 评估 的时候,预测采样的 reward 和动作的 mean 和 var"""
+        mean, var = [], []
+        for i in range(0, inputs.shape[0], batch_size):
+            input = torch.from_numpy(inputs[i : i + batch_size]).float().to(self.device)
+            cur_mean, cur_var = self.model(
+                input[None, :, :].repeat([self._num_network, 1, 1]),
+                return_log_var=False,
+            )
+            mean.append(cur_mean.detach().cpu().numpy())
+            var.append(cur_var.detach().cpu().numpy())
+        return np.hstack(mean), np.hstack(var)
+
+
+class FakeEnv:
+    """使用模型进行动作评估"""
+
+    def __init__(self, model):
+        self.model = model
+
+    def step(self, obs, act):
+        """这是一个序列的输入，"""
+        inputs = np.concatenate((obs, act), axis=-1)
+        ensemble_model_means, ensemble_model_vars = self.model.predict(inputs)
+        ensemble_model_means[
+            :, :, 1:
+        ] += obs.numpy()  # 输出的mean是偏移量，需要加上原本的值
+        ensemble_model_stds = np.sqrt(ensemble_model_vars)
+
+        # 根据 均值和方差构建的正态分布 进行采样
+        ensemble_samples = (
+            ensemble_model_means
+            + np.random.normal(size=ensemble_model_means.shape) * ensemble_model_stds
+        )
+
+        num_models, batch_size, _ = ensemble_model_means.shape
+        # 从 所有模型中，为每一个样本 随机 选择一个模型
+        models_to_use = np.random.choice(
+            [i for i in range(self.model._num_network)], size=batch_size
+        )
+
+        batch_inds = np.arange(0, batch_size)
+        # ensemble_samples 形状 模型数量, batch_size, 输出维度
+        samples = ensemble_samples[models_to_use, batch_inds]
+        # samples 形状  batch_size, 输出维度
+        # 其中输出维度 是  1（奖励） + 状态维度
+        rewards, next_obs = samples[:, :1], samples[:, 1:]
+        return rewards, next_obs
+
+    def propagate(self, obs, actions):
+        with torch.no_grad():
+            obs = np.copy(obs)
+            total_reward = np.expand_dims(np.zeros(obs.shape[0]), axis=-1)
+            obs, actions = torch.as_tensor(obs), torch.as_tensor(actions)
+            for i in range(actions.shape[1]):
+                action = torch.unsqueeze(actions[:, i], 1)
+                rewards, next_obs = self.step(obs, action)
+                total_reward += rewards
+                obs = torch.as_tensor(next_obs)
+            return total_reward
+
+
+class PETS:
+    """PETS 算法"""
+
+    def __init__(
+        self,
+        env: gym.Env,
+        buffer_size,
+        n_sequence,
+        elite_raito,
+        plan_horizon,
+        num_episodes,
+        device,
+    ):
+        self._env = env
+        self._env_pool = ReplayBuffer(buffer_size)
+
+        obs_dim = env.observation_space.shape[0]
+        self._action_dim = env.action_space.shape[0]
+        self._model = EnsembleDynamicsModel(obs_dim, self._action_dim, device)
+        self._fake_env = FakeEnv(self._model)
+        self.upper_bound = env.action_space.high[0]
+        self.lower_bound = env.action_space.low[0]
+
+        self._cem = CEM(
+            n_sequence, elite_raito, self._fake_env, self.upper_bound, self.lower_bound
+        )
+        self.plan_horizon = plan_horizon
+        self.num_episodes = num_episodes
+
+    def train_model(self):
+        env_samples = self._env_pool.return_all_samples()
+        obs = env_samples[0]
+        actions = np.array(env_samples[1])
+        rewards = np.array(env_samples[2]).reshape(-1, 1)
+        next_obs = env_samples[3]
+        inputs = np.concatenate([obs, actions], axis=-1)
+        labels = np.concatenate([rewards, next_obs - obs], axis=-1)
+        self._model.train(inputs, labels)
+
+    def mpc(self):
+        """模型预测控制, 用来进行训练一次环境模型之后的 评估"""
+        # 初始化 mean 和 var
+        mean = np.tile((self.upper_bound + self.lower_bound) / 2.0, self.plan_horizon)
+        var = np.tile(
+            np.square(self.upper_bound - self.lower_bound) / 16, self.plan_horizon
+        )
+        obs, _ = self._env.reset(seed=0)
+        done, episode_return = False, 0
+        while not done:
+            # 动作是根据 fake_env 的评估从 分布中采样处来的
+            # 动作个数 和 维度 已经隐含在 mean 和 var 中
+            actions = self._cem.optimizer(obs, mean, var)
+            action = actions[: self._action_dim]  # 选取第一个动作
+            next_obs, reward, terminated, truncated, _ = self._env.step(
+                action
+            )  # 真实环境
+            done = terminated or truncated
+            self._env_pool.add(obs, action, reward, next_obs, done)
+            obs = next_obs
+            episode_return += reward
+            # 去除第一个动作，在后面添加空白
+            mean = np.concatenate(
+                [
+                    np.copy(actions)[self._action_dim :],
+                    np.zeros(self._action_dim),
+                ]
+            )
+        return episode_return
+
+    def explore(self):
+        """探索一次， 生成一些数据"""
+        obs, _ = self._env.reset()
+        done, episode_return = False, 0
+        while not done:
+            action = self._env.action_space.sample()
+            next_obs, reward, terminated, truncated, _ = self._env.step(
+                action
+            )  # 真实环境
+            done = terminated or truncated
+            self._env_pool.add(obs, action, reward, next_obs, done)
+            obs = next_obs
+            episode_return += reward
+        return episode_return
+
+    def train(self):
+        return_list = []
+        explore_return = self.explore()  # 进行随机策略探索来首集一条序列的数据
+        print("episode: 1, return: %d" % explore_return)
+        return_list.append(explore_return)
+
+        for i_episode in range(self.num_episodes - 1):
+            self.train_model()
+            episode_return = self.mpc()
+            return_list.append(episode_return)
+            print("episode: %d, return: %d" % (i_episode + 2, episode_return))
+        return return_list
+
+
+# 第十四章 SAC算法
+
+
+class PolicyNetContinuous_ch14(nn.Module):
+    def __init__(self, state_dim, hidden_dim, action_dim, action_bound):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc_mu = nn.Linear(hidden_dim, action_dim)
+        self.fc_std = nn.Linear(hidden_dim, action_dim)
+        self.action_bound = action_bound
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        mu = self.fc_mu(x)
+        std = F.softplus(self.fc_std(x))  # 约束 std 非负
+        dist = torch.distributions.Normal(mu, std)
+        normal_sample = dist.rsample()  # rsample() 是重参数化采样
+        log_prob = dist.log_prob(normal_sample)
+        # 压缩 动作取值在[-1, 1]，在乘上action_bound 即可
+        # 压缩后 log 概率密度也要变换，使用 概率密度修正公式
+        action = torch.tanh(normal_sample)
+        # 计算tanh_normal分布的对数概率密度,使用概率密度修正公式
+        log_prob = log_prob - torch.log(1 - torch.tanh(action).pow(2) + 1e-7)
+        action = action * self.action_bound  # 得到真正的动作
+        return action, log_prob
+
+
+class QValueNetContinuous_ch14(nn.Module):
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim + action_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_out = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x, a):
+        cat = torch.cat([x, a], dim=1)
+        x = F.relu(self.fc1(cat))
+        x = F.relu(self.fc2(x))
+        return self.fc_out(x)
+
+
+class SACContinuous:
+    """处理连续动作的SAC算法"""
+
+    def __init__(
+        self,
+        state_dim,
+        hidden_dim,
+        action_dim,
+        action_bound,
+        actor_lr,
+        critic_lr,
+        alpha_lr,
+        target_entropy,
+        tau,
+        gamma,
+        device,
+    ):
+        self.actor = PolicyNetContinuous_ch14(
+            state_dim, hidden_dim, action_dim, action_bound
+        ).to(device)
+        # 两个Q网络
+        self.critic_1 = QValueNetContinuous_ch14(state_dim, hidden_dim, action_dim).to(
+            device
+        )
+        self.critic_2 = QValueNetContinuous_ch14(state_dim, hidden_dim, action_dim).to(
+            device
+        )
+        # 两个目标Q网络
+        self.target_critic_1 = QValueNetContinuous_ch14(
+            state_dim, hidden_dim, action_dim
+        ).to(device)
+        self.target_critic_2 = QValueNetContinuous_ch14(
+            state_dim, hidden_dim, action_dim
+        ).to(device)
+
+        # 目标Q网络的初始参数和Q网络一样
+        self.target_critic_1.load_state_dict(self.critic_1.state_dict())
+        self.target_critic_2.load_state_dict(self.critic_2.state_dict())
+
+        # 优化器
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_1_optimizer = torch.optim.Adam(
+            self.critic_1.parameters(), lr=critic_lr
+        )
+        self.critic_2_optimizer = torch.optim.Adam(
+            self.critic_2.parameters(), lr=critic_lr
+        )
+
+        # 使用 alpha 的 log值，可以使训练结果比较稳定
+        self.log_alpha = torch.tensor(np.log(0.01), dtype=torch.float)
+        self.log_alpha.requires_grad = True
+        self.log_alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
+
+        self.target_entropy = target_entropy  # 目标熵大小
+        self.gamma = gamma
+        self.tau = tau
+        self.device = device
+
+    def take_action(self, state):
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        action = self.actor(state)[0]
+        return [action.item()]
+
+    def calc_target(self, rewards, next_states, dones):
+        """计算目标Q值"""
+        next_actions, log_prob = self.actor(next_states)
+        entropy = -log_prob
+        # 两个目标网络 取 更小的
+        q1_value = self.target_critic_1(next_states, next_actions)
+        q2_value = self.target_critic_2(next_states, next_actions)
+
+        next_value = torch.min(q1_value, q2_value) + self.log_alpha.exp() * entropy
+        td_target = rewards + self.gamma * next_value * (1 - dones)
+        return td_target
+
+    def soft_updata(self, net, target_net):
+        for param_target, param in zip(target_net.parameters(), net.parameters()):
+            param_target.data.copy_(
+                param_target.data * (1.0 - self.tau) + param.data * self.tau
+            )
+
+    def update(self, transition_dict):
+        states = torch.tensor(transition_dict["states"], dtype=torch.float).to(
+            self.device
+        )
+        actions = (
+            torch.tensor(transition_dict["actions"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        rewards = (
+            torch.tensor(transition_dict["rewards"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        next_states = torch.tensor(
+            transition_dict["next_states"], dtype=torch.float
+        ).to(self.device)
+        dones = (
+            torch.tensor(transition_dict["dones"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+
+        # 重塑奖励，方便训练 [-16, 0] -> [-1, 1]
+        rewards = (rewards + 8.0) / 8.0
+
+        # 更新两个Q网络
+        td_target = self.calc_target(rewards, next_states, dones)
+        critic_1_loss = torch.mean(
+            F.mse_loss(self.critic_1(states, actions), td_target.detach())
+        )
+        critic_2_loss = torch.mean(
+            F.mse_loss(self.critic_2(states, actions), td_target.detach())
+        )
+
+        self.critic_1_optimizer.zero_grad()
+        critic_1_loss.backward()
+        self.critic_1_optimizer.step()
+        self.critic_2_optimizer.zero_grad()
+        critic_2_loss.backward()
+        self.critic_2_optimizer.step()
+
+        # 更新策略网络
+        new_actions, log_prob = self.actor(states)
+        entropy = -log_prob
+        q1_value = self.critic_1(states, new_actions)
+        q2_value = self.critic_2(states, new_actions)
+        actor_loss = torch.mean(
+            -self.log_alpha.exp() * entropy - torch.min(q1_value, q2_value)
+        )
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # 更新alpha值
+        alpha_loss = torch.mean(
+            (entropy - self.target_entropy).detach() * self.log_alpha.exp()
+        )
+        self.log_alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.log_alpha_optimizer.step()
+
+        # 软更新 目标网络
+        self.soft_updata(self.critic_1, self.target_critic_1)
+        self.soft_updata(self.critic_2, self.target_critic_2)
+
+
+class PolicyNet_ch14(nn.Module):
+    """离散动作策略网络"""
+
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        return F.softmax(self.fc2(x), dim=1)
+
+
+class QvalueNet_ch14(nn.Module):
+    """离散动作的 Q 价值函数"""
+
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, x):
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+
+class SAC:
+    """处理离散动作的SAC算法"""
+
+    def __init__(
+        self,
+        state_dim,
+        hidden_dim,
+        action_dim,
+        actor_lr,
+        critic_lr,
+        alpha_lr,
+        target_entropy,
+        tau,
+        gamma,
+        device,
+    ):
+        # 策略网络
+        self.actor = PolicyNet_ch14(state_dim, hidden_dim, action_dim).to(device)
+        # 第一个Q网络
+        self.critic_1 = QvalueNet_ch14(state_dim, hidden_dim, action_dim).to(device)
+        # 第二个Q网络
+        self.critic_2 = QvalueNet_ch14(state_dim, hidden_dim, action_dim).to(device)
+
+        # 目标网络
+        self.target_critic_1 = QvalueNet_ch14(state_dim, hidden_dim, action_dim).to(
+            device
+        )
+        self.target_critic_2 = QvalueNet_ch14(state_dim, hidden_dim, action_dim).to(
+            device
+        )
+
+        # 令 Q目标网络 初始参数和 Q网络 一致
+        self.target_critic_1.load_state_dict(self.critic_1.state_dict())
+        self.target_critic_2.load_state_dict(self.critic_2.state_dict())
+
+        # 优化器
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_1_optimizer = torch.optim.Adam(
+            self.critic_1.parameters(), lr=critic_lr
+        )
+        self.critic_2_optimizer = torch.optim.Adam(
+            self.critic_2.parameters(), lr=critic_lr
+        )
+
+        # 使用alpha 的log值，使训练更稳定
+        self.log_alpha = torch.tensor(np.log(0.01), dtype=torch.float)
+        self.log_alpha.requires_grad = True
+
+        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
+        self.target_entropy = target_entropy
+        self.gamma = gamma
+        self.tau = tau
+        self.device = device
+
+    def take_action(self, state):
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0).to(self.device)
+        probs = self.actor(state)
+        action_dist = torch.distributions.Categorical(probs)
+        action = action_dist.sample()
+        return action.item()
+
+    def calc_target(self, rewards, next_states, dones):
+        next_probs = self.actor(next_states)
+        next_log_probs = torch.log(next_probs + 1e-8)
+        entropy = -torch.sum(next_probs * next_log_probs, dim=1, keepdim=True)
+        q1_value = self.target_critic_1(next_states)
+        q2_value = self.target_critic_2(next_states)
+        min_qvalue = torch.sum(
+            next_probs * torch.min(q1_value, q2_value), dim=1, keepdim=True
+        )
+        # 目标值加入 交叉熵约束
+        next_value = min_qvalue + self.log_alpha.exp() * entropy
+        td_target = rewards + self.gamma * next_value * (1 - dones)
+        return td_target
+
+    def soft_update(self, net, target_net):
+        for param_target, param in zip(target_net.parameters(), net.parameters()):
+            param_target.data.copy_(
+                param_target.data * (1.0 - self.tau) + param.data * self.tau
+            )
+
+    def update(self, transition_dict):
+        states = torch.tensor(transition_dict["states"], dtype=torch.float).to(
+            self.device
+        )
+        # 动作不是 float类型
+        actions = torch.tensor(transition_dict["actions"]).view(-1, 1).to(self.device)
+        rewards = (
+            torch.tensor(transition_dict["rewards"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+        next_states = torch.tensor(
+            transition_dict["next_states"], dtype=torch.float
+        ).to(self.device)
+        dones = (
+            torch.tensor(transition_dict["dones"], dtype=torch.float)
+            .view(-1, 1)
+            .to(self.device)
+        )
+
+        # 更新两个Q网络
+        td_target = self.calc_target(rewards, next_states, dones)
+        critic_1_q_values = self.critic_1(states).gather(1, actions)
+        critic_2_q_values = self.critic_2(states).gather(1, actions)
+
+        critic_1_loss = torch.mean(F.mse_loss(critic_1_q_values, td_target.detach()))
+        critic_2_loss = torch.mean(F.mse_loss(critic_2_q_values, td_target.detach()))
+
+        self.critic_1_optimizer.zero_grad()
+        critic_1_loss.backward()
+        self.critic_1_optimizer.step()
+
+        self.critic_2_optimizer.zero_grad()
+        critic_2_loss.backward()
+        self.critic_2_optimizer.step()
+
+        # 更新策略网络
+        probs = self.actor(states)
+        # 后面的 1e-8 很重要 防止 actor输出 NAN
+        log_probs = torch.log(probs + 1e-8)
+        # 直接根据概率计算熵
+        entropy = -torch.sum(log_probs * probs, dim=1, keepdim=True)
+        q1_value = self.critic_1(states)
+        q2_value = self.critic_2(states)
+        # 直接根据概率计算期望
+        min_qvalue = torch.sum(
+            probs * torch.min(q1_value, q2_value), dim=1, keepdim=True
+        )
+        actor_loss = torch.mean(-self.log_alpha.exp() * entropy - min_qvalue)
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # 更新alpha值
+        alpha_loss = torch.mean(
+            (entropy - self.target_entropy).detach() * self.log_alpha.exp()
+        )
+        self.alpha_optimizer.zero_grad()
+        alpha_loss.backward()
+        self.alpha_optimizer.step()
+
+        self.soft_update(self.critic_1, self.target_critic_1)
+        self.soft_update(self.critic_2, self.target_critic_2)
